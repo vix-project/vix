@@ -25,4 +25,15 @@ Available recipes:
 ## Downsides of Vix
 - xbps is used for PAM stack and some other system-deep things (PM can be removed, but not the packages)
 - Nix profiles are Nix profiles. Sometimes you need tinkering
-- Wanna add a service? Write runit scripts by yourself, Nixpkgs provide none.
+- Service activation is still manual. [Nix modules](docs/runit.md) can build runit service directories; Nixpkgs provide no runit service definitions.
+
+## Declarative runit services
+
+Build service directories from Nix modules, without changing the host system:
+
+```sh
+nix build --file . services --arg modules '[ ./examples/runit.nix ]'
+```
+
+See [the module documentation](docs/runit.md) for options and tests. This builds
+templates only; applying the configuration to a running system is not implemented.
