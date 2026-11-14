@@ -2,71 +2,160 @@
 set -eu
 
 NIX=/nix/var/nix/profiles/default/bin/nix
-NIXPKGS=nixpkgs
+[ -x "$NIX" ] || NIX="$(command -v nix)"
+state=/var/lib/vix
 
 usage() {
   cat <<'EOF'
-vix - system helpers (Nix backend)
+vix - declarative services and kernels on a running Vix machine
 
-  vix kernel [ATTR]   install kernel ATTR (default: linux) and its modules
-  vix kmod ATTR       build linuxPackages.ATTR for the running kernel, merge modules
-  vix firmware        install linux-firmware into /lib/firmware
+  vix init [DIR]        create a machine flake (default: /etc/vix)
+  vix build [FLAKE#HOST] build a declared system as ./result
+  vix switch [FLAKE#HOST] build and apply it on this running machine
+  vix status            show declared service status
+  vix generations       list saved generations
+  vix rollback [N]      activate generation N (default: previous)
+  vix recover           recover an interrupted activation
 
-for regular packages use nix directly:
-  nix profile add nixpkgs#htop
+The default configuration is /etc/vix#default.
+Declare services.runit, boot.kernelPackages, boot.extraModulePackages and
+hardware.firmware in the machine flake. New kernels take effect at reboot.
+For regular packages use nix profile add nixpkgs#htop.
 EOF
-  exit 1
+  exit "${1:-1}"
 }
 
-[ "$(id -u)" -eq 0 ] || { echo "vix: must be root" >&2; exit 1; }
+require_vix() {
+  if [ ! -r /etc/os-release ] || ! grep -Eq '^ID="?vix"?$' /etc/os-release || [ "$(cat /proc/1/comm)" != runit ]; then
+    echo 'vix: this command requires an already booted Vix system' >&2
+    exit 1
+  fi
+}
+
+build_system() {
+  reference="${1:-/etc/vix#default}"
+  case "$reference" in
+    *'#'*) flake="${reference%%#*}"; host="${reference#*#}" ;;
+    *) flake="$reference"; host=default ;;
+  esac
+  [ -n "$flake" ] || flake=.
+  if ! printf '%s\n' "$host" | grep -Eq '^[a-zA-Z0-9_-]+$'; then
+    echo 'vix: select a host as FLAKE#HOST (letters, digits, underscores and hyphens)' >&2
+    exit 1
+  fi
+  if [ "$flake" = /etc/vix ] && [ ! -f /etc/vix/flake.nix ]; then
+    echo 'vix: no machine flake; run vix init and edit /etc/vix/flake.nix' >&2
+    exit 1
+  fi
+  "$NIX" build "$flake#vixConfigurations.\"$host\".config.system.build.toplevel" \
+    --out-link "$2" --print-out-paths
+}
+
+interrupt_switch() {
+  if [ -n "${activation_pid:-}" ]; then
+    kill -TERM "$activation_pid" 2>/dev/null || true
+    wait "$activation_pid" || true
+  fi
+  exit "$1"
+}
 
 cmd="${1:-}"
 [ -n "$cmd" ] || usage
 shift || true
+case "$cmd" in --help|-h|help) usage 0 ;; esac
+case "$cmd" in
+  build) ;;
+  *) [ "$(id -u)" -eq 0 ] || { echo 'vix: must be root' >&2; exit 1; } ;;
+esac
 
 case "$cmd" in
-  kernel)
-    attr="${1:-linux}"
-    kimg="$("$NIX" build --no-link --print-out-paths "$NIXPKGS#$attr" | head -1)"
-    kmods="$("$NIX" build --no-link --print-out-paths "$NIXPKGS#$attr.modules" | head -1)"
-    kver="$(ls "$kmods/lib/modules")"
-    mkdir -p /lib/modules /boot
-    rm -rf "/lib/modules/$kver"
-    cp -a "$kmods/lib/modules/$kver" "/lib/modules/"
-    depmod "$kver"
-    cp "$kimg/bzImage" "/boot/vmlinuz-$kver"
-    echo "vix: kernel $kver ready (/boot/vmlinuz-$kver, /lib/modules/$kver)"
+  init)
+    [ $# -le 1 ] || usage
+    require_vix
+    directory="${1:-/etc/vix}"
+    if [ -e "$directory/flake.nix" ] || [ -L "$directory/flake.nix" ]; then
+      echo "vix: keeping existing machine flake: $directory/flake.nix" >&2
+      exit 1
+    fi
+    source="${VIX_FLAKE_URL:-github:vix-project/vix}"
+    if ! printf '%s\n' "$source" | grep -Eq '^[a-zA-Z0-9_./:+?=&%~@#-]+$'; then
+      echo 'vix: invalid VIX_FLAKE_URL' >&2
+      exit 1
+    fi
+    uuid="$(findmnt -n -o UUID /)"
+    root_device=/dev/ROOT
+    [ -z "$uuid" ] || root_device="UUID=$uuid"
+    mkdir -p "$directory"
+    (
+      set -C
+      cat > "$directory/flake.nix" <<EOF
+{
+  inputs.vix.url = "$source";
+
+  outputs = { vix, ... }: {
+    vixConfigurations.default = vix.lib.vixSystem {
+      system = "x86_64-linux";
+      modules = [ ({ pkgs, config, ... }: {
+        boot.rootDevice = "$root_device";
+        # Opt in to generation-based GRUB boot management:
+        # boot.kernel.enable = true;
+        # boot.kernelPackages = pkgs.linuxPackages;
+        # boot.extraModulePackages = [ config.boot.kernelPackages.v4l2loopback ];
+        # hardware.firmware = [ pkgs.linux-firmware pkgs.wireless-regdb ];
+
+        services.runit = {
+          # example = {
+          #   enable = true;
+          #   run = "exec \${pkgs.coreutils}/bin/sleep infinity";
+          #   log.enable = true;
+          # };
+        };
+      }) ];
+    };
+  };
+}
+EOF
+    )
+    echo "vix: created $directory/flake.nix; edit it, then run vix switch $directory#default"
     ;;
-  kmod)
-    [ $# -eq 1 ] || usage
-    attr="$1"
-    kver="$(uname -r)"
-    pkg="$("$NIX" build --no-link --print-out-paths "$NIXPKGS#linuxPackages.$attr" | head -1)"
-    merged=0
-    for sub in "lib/modules/$kver" "kernel"; do
-      if [ -d "$pkg/$sub" ]; then
-        mkdir -p "/lib/modules/$kver"
-        cp -a "$pkg/$sub/." "/lib/modules/$kver/"
-        merged=1
-      fi
-    done
-    [ "$merged" -eq 1 ] || { echo "vix: no modules for $kver in linuxPackages.$attr" >&2; exit 1; }
-    depmod "$kver" && echo "vix: modules from $attr merged and depmod done"
+  build)
+    [ $# -le 1 ] || usage
+    build_system "${1:-/etc/vix#default}" "$(pwd)/result"
     ;;
-  firmware)
-    mkdir -p /lib/firmware
-    for p in linux-firmware sof-firmware alsa-firmware; do
-      d="$("$NIX" build --no-link --print-out-paths "$NIXPKGS#$p" | head -1)"
-      [ -d "$d/lib/firmware" ] || continue
-      for e in "$d"/lib/firmware/*; do
-        ln -sfn "$e" "/lib/firmware/$(basename "$e")"
-      done
-    done
-    reg="$("$NIX" build --no-link --print-out-paths "$NIXPKGS#wireless-regdb" | head -1)"
-    cp -a "$reg/lib/firmware/." /lib/firmware/
-    echo "vix: firmware installed"
+  switch)
+    [ $# -le 1 ] || usage
+    require_vix
+    mkdir -p "$state"
+    temporary="$(mktemp -d "$state/build.XXXXXX")"
+    trap 'rm -rf "$temporary"' EXIT
+    trap 'interrupt_switch 130' INT
+    trap 'interrupt_switch 143' TERM
+    system="$(build_system "${1:-/etc/vix#default}" "$temporary/result")"
+    "$system/bin/vix-activate" switch "$system" &
+    activation_pid=$!
+    wait "$activation_pid"
     ;;
-  *)
-    usage
+  status|generations|rollback|recover|boot)
+    require_vix
+    driver="$state/current/bin/vix-activate"
+    if [ "$cmd" = recover ] && [ -e "$state/pending/bin/vix-activate" ]; then
+      driver="$state/pending/bin/vix-activate"
+    fi
+    if [ ! -e "$driver" ]; then
+      case "$cmd" in
+        status) echo 'vix: no active declared services'; exit 0 ;;
+        generations) echo 'vix: no saved generations'; exit 0 ;;
+        recover)
+          [ ! -f "$state/transaction.json" ] || { echo 'vix: recovery driver is missing' >&2; exit 1; }
+          exit 0 ;;
+        *) echo 'vix: no saved generations' >&2; exit 1 ;;
+      esac
+    fi
+    exec "$driver" "$cmd" "$@"
     ;;
+  kernel|kmod|firmware)
+    echo "vix: $cmd is declarative now; edit boot.kernelPackages, boot.extraModulePackages or hardware.firmware in your machine flake, then run vix switch" >&2
+    exit 1
+    ;;
+  *) usage ;;
 esac
