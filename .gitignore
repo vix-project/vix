@@ -1,2 +1,6 @@
 root/
 __pycache__/
+.cache
+build/
+.initrd/
+*.iso
