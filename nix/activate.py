@@ -80,7 +80,16 @@ def exists(path):
 
 class Manager:
     def __init__(
-        self, state, scan, roots, sv="sv", timeout=30, boot=None, boot_hook=None
+        self,
+        state,
+        scan,
+        roots,
+        sv="sv",
+        timeout=30,
+        boot=None,
+        boot_hook=None,
+        profile=None,
+        profile_hook=None,
     ):
         self.state = Path(state)
         self.scan = Path(scan)
@@ -93,6 +102,10 @@ class Manager:
         self.timeout = timeout
         self.boot = boot or BootManager()
         self.boot_hook = Path(boot_hook) if boot_hook is not None else None
+        self.profile = Path(profile) if profile is not None else None
+        self.profile_hook = (
+            Path(profile_hook) if profile_hook is not None else None
+        )
 
     @contextlib.contextmanager
     def locked(self):
@@ -109,6 +122,8 @@ class Manager:
                 self.roots,
             ):
                 directory.mkdir(parents=True, exist_ok=True)
+            if self.profile is not None:
+                self.profile.parent.mkdir(parents=True, exist_ok=True)
             if not self.scan.is_dir():
                 raise ActivationError(f"runit scan directory is missing: {self.scan}")
             yield
@@ -181,6 +196,62 @@ class Manager:
                 digest.update(b"\0")
             result[service.name] = (service, digest.hexdigest())
         return result
+
+    def load_packages(self, system):
+        if system is None:
+            return None
+        packages = Path(system).resolve(strict=True) / "packages"
+        if not exists(packages):
+            # Generations created before package management are still valid.
+            return None
+        packages = packages.resolve(strict=True)
+        if not packages.is_dir():
+            raise ActivationError(f"invalid package environment: {packages}")
+        return packages
+
+    def profile_hook_contents(self):
+        path = os.fspath(self.profile)
+        return (
+            "# Managed by Vix: packages from the active generation.\n"
+            f'export PATH="{path}/bin:{path}/sbin:$PATH"\n'
+        ).encode()
+
+    def preflight_packages(self, system):
+        packages = self.load_packages(system)
+        if self.profile is not None and exists(self.profile):
+            if not self.profile.is_symlink():
+                raise ActivationError(
+                    f"refusing to replace unmanaged package profile: {self.profile}"
+                )
+        if self.profile_hook is not None and packages is not None and exists(
+            self.profile_hook
+        ):
+            if self.profile_hook.is_symlink() or not self.profile_hook.read_text(
+                errors="replace"
+            ).startswith("# Managed by Vix:"):
+                raise ActivationError(
+                    f"refusing to replace unmanaged profile hook: {self.profile_hook}"
+                )
+        return packages
+
+    def apply_packages(self, system):
+        packages = self.preflight_packages(system)
+        if self.profile is not None:
+            if packages is None:
+                if exists(self.profile):
+                    self.profile.unlink()
+                    fsync_dir(self.profile.parent)
+            else:
+                atomic_link(packages, self.profile)
+        if self.profile_hook is not None:
+            if packages is not None and self.profile is not None:
+                atomic_file(self.profile_hook, self.profile_hook_contents())
+            elif exists(self.profile_hook) and not self.profile_hook.is_symlink():
+                if self.profile_hook.read_text(errors="replace").startswith(
+                    "# Managed by Vix:"
+                ):
+                    self.profile_hook.unlink()
+                    fsync_dir(self.profile_hook.parent)
 
     def preflight(self, names):
         for name in names:
@@ -336,9 +407,11 @@ class Manager:
         old = self.load(transaction["old_system"])
         touched = transaction["touched"]
         self.preflight(set(old) | set(touched))
+        self.preflight_packages(transaction["old_system"])
         self.boot.restore(transaction.get("boot"))
         self.stop(touched)
         self.install(old)
+        self.apply_packages(transaction["old_system"])
         if boot:
             for name in old:
                 atomic_link(self.runtime / name, self.scan / name)
@@ -357,6 +430,74 @@ class Manager:
         self.finish_transaction()
         print("vix: restored the previous service configuration", flush=True)
 
+    def install_generation(self, system):
+        """Seed a target root filesystem without starting services.
+
+        The installer runs this inside the copied root before first boot.
+        Derived services are linked for runsvdir; boot and package state are
+        prepared for the running system.
+        """
+        if self.journal.exists():
+            raise ActivationError(
+                "target has an interrupted activation; run vix recover on it first"
+            )
+        system = Path(system).resolve(strict=True)
+        desired = self.load(system)
+        current = self.current_id()
+        old_system = self.generation_system(current) if current is not None else None
+        self.preflight(desired.keys())
+        self.preflight_packages(system)
+        if self.boot_hook is not None:
+            if not self.boot_hook.parent.is_dir():
+                raise ActivationError("Void runit core-services directory is missing")
+            if exists(self.boot_hook) and (
+                self.boot_hook.is_symlink()
+                or not self.boot_hook.read_text().startswith("# Managed by Vix:")
+            ):
+                raise ActivationError(
+                    f"refusing to replace unmanaged boot hook: {self.boot_hook}"
+                )
+        if any(self.supervised(self.runtime / name) for name in desired):
+            raise ActivationError("installation must run before runsvdir starts")
+
+        # Reinstalling keeps the target's other runit services but removes
+        # links that belonged to a previous Vix generation.
+        for link in self.scan.iterdir():
+            if link.name in desired:
+                continue
+            if link.is_symlink() and os.readlink(link) == str(
+                self.runtime / link.name
+            ):
+                link.unlink()
+        fsync_dir(self.scan)
+        for name in desired:
+            (self.scan / name).unlink(missing_ok=True)
+        self.install(desired)
+        for name in desired:
+            atomic_link(self.runtime / name, self.scan / name)
+        if self.boot_hook is not None:
+            atomic_file(self.boot_hook, BOOT_HOOK.encode())
+        self.apply_packages(system)
+
+        target_id = max(self.generation_ids(), default=0) + 1
+        atomic_link(system, self.roots / str(target_id))
+        atomic_link(system, self.generations / str(target_id))
+        atomic_json(
+            {
+                "created": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            },
+            self.metadata / f"{target_id}.json",
+        )
+        if self.boot.load(old_system) is not None or self.boot.load(system) is not None:
+            self.boot.activate(
+                system,
+                target_id,
+                {n: self.generation_system(n) for n in self.generation_ids()},
+            )
+        atomic_link(f"generations/{target_id}", self.state / "current")
+        print(f"vix: installed generation {target_id}", flush=True)
+        return target_id
+
     def apply(self, system, target_id=None):
         self.recover()
         system = Path(system).resolve(strict=True)
@@ -365,6 +506,7 @@ class Manager:
         old_system = self.generation_system(old_id) if old_id is not None else None
         old = self.load(old_system)
         self.preflight(set(old) | set(desired))
+        self.preflight_packages(system)
         boot_snapshot = self.boot.snapshot(old_system, system)
         if self.boot_hook is not None:
             if not self.boot_hook.parent.is_dir():
@@ -379,6 +521,7 @@ class Manager:
         if old_system == system:
             self.install(desired)
             self.start(desired.keys())
+            self.apply_packages(system)
             print(f"vix: generation {old_id} is already current", flush=True)
             return old_id
         unchanged = {
@@ -426,6 +569,7 @@ class Manager:
                     n: self.generation_system(n) for n in self.generation_ids()
                 }
                 self.boot.activate(system, target_id, generations)
+            self.apply_packages(system)
             atomic_link(f"generations/{target_id}", self.state / "current")
             transaction["phase"] = "committed"
             atomic_json(transaction, self.journal)
@@ -507,6 +651,11 @@ class Manager:
                 atomic_link(booted, self.roots.parent / "vix-booted-system")
         self.recover(boot=True)
         if interrupted or selected is None:
+            if not interrupted:
+                current = self.current_id()
+                self.apply_packages(
+                    self.generation_system(current) if current is not None else None
+                )
             return
         system = self.generation_system(selected)
         desired = self.load(system)
@@ -515,6 +664,7 @@ class Manager:
         old = self.load(old_system)
         names = set(old) | set(desired)
         self.preflight(names)
+        self.preflight_packages(system)
         if any(self.supervised(self.runtime / name) for name in names):
             raise ActivationError("boot generation selection must run before runsvdir")
         for name in names:
@@ -528,6 +678,7 @@ class Manager:
                 selected,
                 {n: self.generation_system(n) for n in self.generation_ids()},
             )
+        self.apply_packages(system)
         atomic_link(f"generations/{selected}", self.state / "current")
 
     def status(self):
@@ -564,6 +715,7 @@ def main():
     parser = argparse.ArgumentParser(description="Vix generation activation")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("switch").add_argument("system", type=Path)
+    commands.add_parser("install").add_argument("system", type=Path)
     rollback = commands.add_parser("rollback")
     rollback.add_argument("generation", type=int, nargs="?")
     commands.add_parser("generations")
@@ -575,9 +727,6 @@ def main():
     arguments = parser.parse_args()
     if os.geteuid() != 0:
         raise ActivationError("must be root")
-    release = Path("/etc/os-release").read_text().splitlines()
-    if not any(line in ("ID=vix", 'ID="vix"') for line in release):
-        raise ActivationError("activation is supported only on Vix")
     timeout = int(os.environ.get("VIX_SWITCH_TIMEOUT", "30"))
     if not 1 <= timeout <= 3600:
         raise ActivationError("VIX_SWITCH_TIMEOUT must be between 1 and 3600 seconds")
@@ -587,7 +736,20 @@ def main():
         "/nix/var/nix/gcroots/vix",
         timeout=timeout,
         boot_hook="/etc/runit/core-services/99-vix.sh",
+        profile="/nix/var/nix/profiles/vix-system",
+        profile_hook="/etc/profile.d/vix-system.sh",
     )
+    if arguments.command == "install":
+        if arguments.system.resolve().parent != Path("/nix/store"):
+            raise ActivationError(
+                "the system must be a build output directly in /nix/store"
+            )
+        with manager.locked():
+            manager.install_generation(arguments.system)
+        return
+    release = Path("/etc/os-release").read_text().splitlines()
+    if not any(line in ("ID=vix", 'ID="vix"') for line in release):
+        raise ActivationError("activation is supported only on Vix")
     offline_boot = arguments.command == "boot" or (
         arguments.command == "recover" and arguments.boot
     )

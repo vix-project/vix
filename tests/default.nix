@@ -12,6 +12,14 @@ pkgs.linkFarm "vix-tests" [
     path = import ./services.nix { inherit pkgs; };
   }
   {
+    name = "packages";
+    path = import ./packages.nix { inherit pkgs; };
+  }
+  {
+    name = "scripts";
+    path = import ./scripts.nix { inherit pkgs; };
+  }
+  {
     name = "activation";
     path = import ./activation.nix { inherit pkgs; };
   }

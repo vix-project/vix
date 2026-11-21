@@ -15,6 +15,8 @@
         packages.vix = import ./package.nix { inherit pkgs; };
         packages.default = import ./package.nix { inherit pkgs; };
         checks.services = import ./tests/services.nix { inherit pkgs; };
+        checks.packages = import ./tests/packages.nix { inherit pkgs; };
+        checks.scripts = import ./tests/scripts.nix { inherit pkgs; };
         checks.activation = import ./tests/activation.nix { inherit pkgs; };
         checks.boot = import ./tests/boot.nix { inherit pkgs; };
         checks.kernel = import ./tests/kernel.nix { inherit pkgs; };

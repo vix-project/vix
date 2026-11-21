@@ -7,7 +7,15 @@ and generation history. The project is built with flake-parts.
 
 ## Install and initialize
 
-On an already booted Vix system:
+`vix-install` initializes `/etc/vix/flake.nix` on a new target with the target
+root UUID, builds it, and seeds the first declarative generation before the
+first boot. If the target already has a machine flake, the installer reuses it
+instead of overwriting it. After boot, later changes use `vix switch`. The
+first build resolves the flake inputs, so network access or a cached
+`VIX_FLAKE_URL` is needed; for an unmerged branch set `VIX_FLAKE_URL` as
+described below.
+
+On an already booted Vix system that was installed without a machine flake:
 
 ```sh
 nix profile add github:vix-project/vix#vix
@@ -18,7 +26,8 @@ Open a new login shell if the Nix profile's `bin` directory is not on `PATH`.
 `vix init` creates a machine flake and records the current root filesystem UUID.
 It refuses to overwrite an existing flake. It does not enable any service or
 replace the current kernel. For another configuration directory use
-`vix init /path/to/config`.
+`vix init /path/to/config`. `VIX_ROOT_DEVICE` overrides the detected UUID; the
+installer uses this to generate the target's flake.
 
 Edit the generated flake on the Vix machine, for example:
 
@@ -87,6 +96,46 @@ and support `imports`, `mkDefault`, `mkForce`, `mkBefore` and `mkAfter`.
 
 Activation requires root on an already booted Vix machine in runit's `default`
 runlevel. `vix build` can run without root and does not activate anything.
+
+## Install packages
+
+Declare system packages in a machine module:
+
+```nix
+{ pkgs, ... }: {
+  environment.systemPackages = with pkgs; [
+    git
+    htop
+    ripgrep
+  ];
+}
+```
+
+Then apply the machine flake:
+
+```sh
+vix switch
+# Open a new login shell to pick up the updated PATH.
+```
+
+`vix switch` builds a combined package environment and atomically points
+`/nix/var/nix/profiles/vix-system` at it. It also maintains
+`/etc/profile.d/vix-system.sh`, which prepends the profile's `bin` and `sbin`
+directories to `PATH`. Existing login shells keep their old `PATH`; open a new
+shell or source the profile hook.
+
+Packages are part of the generation. `vix rollback` restores both the services
+and the package environment of the selected generation, and the generation's
+Nix closure stays rooted. Removing a package from the list and switching
+removes it from the profile. Package collisions are resolved deterministically
+by the build environment, so a later package can override an earlier one.
+
+The profile is independent of Nix's per-user profiles and of the
+`vix-network` profile used by the base image. Use `environment.systemPackages`
+for packages that should be available system-wide; per-user `nix profile add`
+remains available for personal tools. Declared services receive the same
+package environment on `PATH`; set `services.runit.<name>.environment.PATH` to
+override it.
 
 ## Runit options
 

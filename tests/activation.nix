@@ -52,6 +52,16 @@ let
   };
   collision = build { foreign = service "foreign" "must not start"; };
   empty = build { };
+  packagesOne = pkgs.buildEnv {
+    name = "vix-test-packages-one";
+    paths = [ pkgs.hello ];
+    pathsToLink = [ "/bin" ];
+  };
+  packagesTwo = pkgs.buildEnv {
+    name = "vix-test-packages-two";
+    paths = [ pkgs.ripgrep ];
+    pathsToLink = [ "/bin" ];
+  };
 in
 pkgs.runCommand "vix-activation-tests"
   {
@@ -66,6 +76,8 @@ pkgs.runCommand "vix-activation-tests"
     VIX_BAD = bad;
     VIX_COLLISION = collision;
     VIX_EMPTY = empty;
+    VIX_PACKAGES_ONE = packagesOne;
+    VIX_PACKAGES_TWO = packagesTwo;
   }
   ''
     python3 ${./activation.py}

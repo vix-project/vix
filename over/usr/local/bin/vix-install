@@ -14,6 +14,10 @@ usage: $prog <root> [disk]
   BIOS: pass [disk]                    (no ESP required)
 
 both can be combined.
+
+The installer creates a machine flake at <root>/etc/vix/flake.nix when the
+target has none, builds it, and installs the resulting declarative generation.
+An existing machine flake is reused. Services are linked for first boot.
 EOF
   exit 1
 }
@@ -41,26 +45,83 @@ fi
 
 [ -e /usr/lib/vix/vmlinuz ] || { echo "$prog: no /usr/lib/vix/vmlinuz (rebuild image)" >&2; exit 1; }
 
+nix=/nix/var/nix/profiles/default/bin/nix
+[ -x "$nix" ] || nix="$(command -v nix 2>/dev/null || true)"
+[ -n "$nix" ] || { echo "$prog: nix is not available" >&2; exit 1; }
+vix="$(command -v vix 2>/dev/null || true)"
+[ -n "$vix" ] || { echo "$prog: vix is not available" >&2; exit 1; }
+
 rootdev="$(findmnt -no SOURCE "$root")"
 rootuuid="$(blkid -s UUID -o value "$rootdev")"
 rootfs="$(blkid -s TYPE -o value "$rootdev")"
 
+status_file=
+temporary_flake=
+proc_mounted=
+sys_mounted=
+dev_mounted=
+cleanup() {
+  rm -f "${status_file:-}"
+  [ -z "${dev_mounted:-}" ] || umount -R "$root/dev" 2>/dev/null || true
+  [ -z "${sys_mounted:-}" ] || umount -R "$root/sys" 2>/dev/null || true
+  [ -z "${proc_mounted:-}" ] || umount -R "$root/proc" 2>/dev/null || true
+  if [ -n "${temporary_flake:-}" ]; then
+    rm -rf "$temporary_flake"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ -f "$root/etc/vix/flake.nix" ]; then
+  flake="$root/etc/vix"
+  existing_flake=yes
+  echo ">> using declarative configuration in $flake"
+else
+  existing_flake=no
+  temporary_flake="$(mktemp -d)"
+  VIX_ROOT_DEVICE="UUID=$rootuuid" "$vix" init "$temporary_flake"
+  flake="$temporary_flake"
+fi
+
+echo ">> building declarative system"
+system="$("$nix" build "$flake#vixConfigurations.default.config.system.build.toplevel" \
+  --no-link --print-out-paths)"
+case "$system" in
+  /nix/store/*) ;;
+  *) echo "$prog: nix build returned an invalid system path: $system" >&2; exit 1 ;;
+esac
+
 echo ">> copying system to $root (this takes a while)"
-st="$(mktemp)"
-trap 'rm -f "$st"' EXIT INT TERM
+status_file="$(mktemp)"
 {
   if tar -C / --one-file-system \
     --exclude='./proc/*' --exclude='./sys/*' --exclude='./dev/*' \
     --exclude='./run/*' --exclude='./tmp/*' --exclude='./mnt/*' \
+    --exclude='./etc/vix' \
+    --exclude='./var/lib/vix' \
+    --exclude='./nix/var/nix/gcroots/vix' \
+    --exclude='./nix/var/nix/profiles/vix-system' \
+    --exclude='./etc/profile.d/vix-system.sh' \
+    --exclude='./etc/runit/core-services/99-vix.sh' \
     --numeric-owner -cf - .; then
-    echo 0 >"$st"
+    echo 0 >"$status_file"
   else
-    echo "$?" >"$st"
+    echo "$?" >"$status_file"
   fi
 } | tar -C "$root" --numeric-owner -xf -
-if [ "$(cat "$st")" -ne 0 ]; then
-  echo "$prog: copy from live system failed (tar exit $(cat "$st")); $root is incomplete - installation aborted" >&2
+if [ "$(cat "$status_file")" -ne 0 ]; then
+  echo "$prog: copy from live system failed (tar exit $(cat "$status_file")); $root is incomplete - installation aborted" >&2
   exit 1
+fi
+
+if [ "$existing_flake" = no ]; then
+  echo ">> machine flake"
+  mkdir -p "$root/etc/vix"
+  cp "$flake/flake.nix" "$root/etc/vix/flake.nix"
+  if [ -f "$flake/flake.lock" ]; then
+    cp "$flake/flake.lock" "$root/etc/vix/flake.lock"
+  fi
 fi
 
 echo ">> fstab"
@@ -86,16 +147,31 @@ menuentry "Vix" {
 }
 EOF
 
+echo ">> declarative generation"
+if ! mountpoint -q "$root/proc"; then
+  mount --rbind /proc "$root/proc"
+  proc_mounted=yes
+fi
+if ! mountpoint -q "$root/sys"; then
+  mount --rbind /sys "$root/sys"
+  sys_mounted=yes
+fi
+if ! mountpoint -q "$root/dev"; then
+  mount --rbind /dev "$root/dev"
+  dev_mounted=yes
+fi
+chroot "$root" "$system/bin/vix-activate" install "$system"
+
 if [ "$have_esp" = yes ]; then
   echo ">> grub-install (UEFI)"
-  nix shell nixpkgs#grub2_efi -c grub-install \
+  "$nix" shell nixpkgs#grub2_efi -c grub-install \
     --target=x86_64-efi --efi-directory="$root/boot" --boot-directory="$root/boot" \
     --removable --no-nvram --recheck
 fi
 
 if [ -n "$disk" ]; then
   echo ">> grub-install (BIOS) -> $disk"
-  nix shell nixpkgs#grub2 -c grub-install \
+  "$nix" shell nixpkgs#grub2 -c grub-install \
     --target=i386-pc --boot-directory="$root/boot" --recheck "$disk"
 fi
 

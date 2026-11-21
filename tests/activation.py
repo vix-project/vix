@@ -64,6 +64,15 @@ class ActivationTests(unittest.TestCase):
         with self.manager.locked():
             return self.manager.apply(fixture(name))
 
+    def package_system(self, name, fixture_name, packages=None):
+        system = self.root / name
+        system.mkdir()
+        (system / "services").symlink_to(fixture(fixture_name) / "services")
+        if packages is not None:
+            (system / "packages").symlink_to(Path(os.environ[packages]))
+        (system / "vix-system.json").write_text('{"format":1}')
+        return system
+
     def pid(self, name):
         output = subprocess.check_output(
             ["sv", "status", str(self.manager.runtime / name)], text=True
@@ -374,6 +383,91 @@ class ActivationTests(unittest.TestCase):
         self.assertFalse(activation.exists(system_marker))
         self.assertEqual(self.manager.current_id(), 1)
         self.assertEqual(self.pid("worker"), original)
+
+    def test_declared_packages_follow_generations_and_rollback(self):
+        self.manager.profile = self.root / "profile"
+        self.manager.profile_hook = self.root / "profile.d/vix-system.sh"
+        first = self.package_system("packages-one", "FIRST", "VIX_PACKAGES_ONE")
+        second = self.package_system("packages-two", "SECOND", "VIX_PACKAGES_TWO")
+        empty = self.package_system("packages-empty", "EMPTY")
+
+        with self.manager.locked():
+            self.manager.apply(first)
+        self.assertTrue((self.manager.profile / "bin/hello").is_file())
+        hook = self.manager.profile_hook.read_text()
+        self.assertTrue(hook.startswith("# Managed by Vix:"))
+        self.assertIn(str(self.manager.profile), hook)
+
+        with self.manager.locked():
+            self.manager.apply(second)
+        self.assertTrue((self.manager.profile / "bin/rg").is_file())
+        self.assertFalse(activation.exists(self.manager.profile / "bin/hello"))
+
+        with self.manager.locked():
+            self.manager.rollback(1)
+        self.assertTrue((self.manager.profile / "bin/hello").is_file())
+        self.assertFalse(activation.exists(self.manager.profile / "bin/rg"))
+
+        with self.manager.locked():
+            self.manager.apply(empty)
+        self.assertFalse(activation.exists(self.manager.profile))
+        self.assertFalse(activation.exists(self.manager.profile_hook))
+        self.assert_clean()
+
+    def test_offline_install_seeds_a_generation_without_starting_services(self):
+        target = self.root / "target"
+        scan = target / "etc/runit/runsvdir/default"
+        scan.mkdir(parents=True)
+        (target / "etc/runit/core-services").mkdir(parents=True)
+        (target / "etc/profile.d").mkdir(parents=True)
+        (target / "nix/var/nix/profiles").mkdir(parents=True)
+        manager = activation.Manager(
+            target / "var/lib/vix",
+            scan,
+            target / "nix/var/nix/gcroots/vix",
+            timeout=8,
+            boot_hook=target / "etc/runit/core-services/99-vix.sh",
+            profile=target / "nix/var/nix/profiles/vix-system",
+            profile_hook=target / "etc/profile.d/vix-system.sh",
+        )
+        system = self.package_system("install-system", "FIRST", "VIX_PACKAGES_ONE")
+        foreign = scan / "agetty-tty1"
+        foreign.symlink_to("/etc/sv/agetty-tty1")
+
+        with manager.locked():
+            self.assertEqual(manager.install_generation(system), 1)
+        self.assertEqual(manager.current_id(), 1)
+        self.assertEqual((manager.generations / "1").resolve(), system.resolve())
+        self.assertTrue((scan / "worker").is_symlink())
+        self.assertEqual(
+            os.readlink(scan / "worker"), str(manager.runtime / "worker")
+        )
+        self.assertEqual(os.readlink(foreign), "/etc/sv/agetty-tty1")
+        self.assertFalse(manager.supervised(manager.runtime / "worker"))
+        self.assertTrue((manager.profile / "bin/hello").is_file())
+        self.assertTrue(manager.boot_hook.read_text().startswith("# Managed by Vix:"))
+        self.assertTrue(
+            manager.profile_hook.read_text().startswith("# Managed by Vix:")
+        )
+        self.assertEqual(manager.generation_ids(), [1])
+
+    def test_foreign_profile_hook_is_not_replaced(self):
+        self.manager.profile = self.root / "profile"
+        self.manager.profile_hook = self.root / "profile.d/vix-system.sh"
+        self.manager.profile_hook.parent.mkdir()
+        self.manager.profile_hook.write_text("# my own PATH hook\n")
+        system = self.package_system("packages-foreign", "FIRST", "VIX_PACKAGES_ONE")
+        with self.assertRaisesRegex(
+            activation.ActivationError, "unmanaged profile hook"
+        ):
+            with self.manager.locked():
+                self.manager.apply(system)
+        self.assertEqual(
+            self.manager.profile_hook.read_text(), "# my own PATH hook\n"
+        )
+        self.assertFalse(activation.exists(self.manager.profile))
+        self.assertIsNone(self.manager.current_id())
+        self.assertEqual(list(self.scan.iterdir()), [])
 
     def test_empty_generation_stops_only_managed_services(self):
         self.apply("FIRST")

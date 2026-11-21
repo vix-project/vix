@@ -1,1 +1,1 @@
-Defaults secure_path="/nix/var/nix/profiles/vix-network/bin:/nix/var/nix/profiles/vix-network/sbin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Defaults secure_path="/nix/var/nix/profiles/vix-system/bin:/nix/var/nix/profiles/vix-system/sbin:/nix/var/nix/profiles/vix-network/bin:/nix/var/nix/profiles/vix-network/sbin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

@@ -13,10 +13,12 @@ let
   succeeds = modules: (builtins.tryEval (build modules).drvPath).success;
 
   service = {
+    environment.systemPackages = [ pkgs.hello ];
     services.runit.worker = {
       enable = true;
       environment.MESSAGE = "hello 'quoted' $world `literal`\nsecond line";
       run = ''
+        hello > "$VIX_TEST_HELLO"
         printf '%s\n' "$MESSAGE"
         printf '%s\n' 'stderr captured' >&2
         exec ${pkgs.coreutils}/bin/sleep 60
@@ -150,6 +152,7 @@ pkgs.runCommand "vix-runit-tests"
     chmod -R u+w "$TMPDIR/worker"
     export VIX_TEST_LOG="$TMPDIR/service.log"
     export VIX_TEST_FINISH="$TMPDIR/finish.status"
+    export VIX_TEST_HELLO="$TMPDIR/hello.txt"
     runsv "$TMPDIR/worker" > "$TMPDIR/runsv.log" 2>&1 &
     supervisor=$!
     trap 'kill "$supervisor" 2>/dev/null || true' EXIT
@@ -161,6 +164,7 @@ pkgs.runCommand "vix-runit-tests"
     done
     sv -w 10 up "$TMPDIR/worker"
     diff -u ${expectedOutput} "$VIX_TEST_LOG"
+    grep -F 'Hello, world!' "$VIX_TEST_HELLO"
 
     sv -w 10 down "$TMPDIR/worker"
     grep -Fx -- '-1 15' "$VIX_TEST_FINISH"

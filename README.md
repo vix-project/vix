@@ -1,4 +1,4 @@
-Vix is a Linux distribution which uses Void rootfs and Nix package manager.
+Vix is a very secure Linux distribution which uses Void rootfs and Nix package manager.
 
 ## How do I install?
 1. Clone the repo
@@ -7,8 +7,12 @@ Vix is a Linux distribution which uses Void rootfs and Nix package manager.
 4. Boot it up
 5. Login as root:vix, partition your drive.
 6. Mount your root to `/mnt` and ESP (for EFI) to `/mnt/boot`
-7. Kernel and firmware updates can be declared after installation in the machine flake (see below).
-8. Run `vix-install /mnt [optionally blockdev for BIOS legacy installation]`
+7. Run `vix-install /mnt [optionally blockdev for BIOS legacy installation]`.
+   The installer creates `/mnt/etc/vix/flake.nix` with the target root UUID,
+   builds it, and seeds the first declarative generation. An existing machine
+   flake on the target is reused.
+8. Optionally edit the machine flake before rebooting. After boot, use `vix switch`
+   for later changes.
 9. Reboot and profit
 
 ## Just
@@ -43,6 +47,16 @@ vix status
 configuration built by `vix.lib.vixSystem`. `vix switch /etc/vix#default` builds
 that flake and starts, updates or removes its declared runit services on the
 already booted machine. Rebuilding an ISO is not required.
+
+System packages are declared in the same flake and installed into a managed
+profile:
+
+```nix
+environment.systemPackages = with pkgs; [ git htop ripgrep ];
+```
+
+After `vix switch`, open a new login shell to use them. The package environment
+is part of the generation, so `vix rollback` restores it together with services.
 
 Kernels are optional and declarative: set `boot.kernel.enable = true`, select
 `boot.kernelPackages`, and declare `boot.extraModulePackages` and

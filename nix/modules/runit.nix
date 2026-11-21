@@ -59,11 +59,16 @@ let
   validName = name: builtins.match "[a-zA-Z0-9_][a-zA-Z0-9_.-]*" name != null;
   validVariable = name: builtins.match "[a-zA-Z_][a-zA-Z0-9_]*" name != null;
 
+  packages = config.system.build.packages or null;
+
   enabled = lib.filterAttrs (_: service: service.enable) config.services.runit;
 
   makeScript =
     name: environment: body:
     pkgs.writeShellScript name ''
+      ${lib.optionalString (packages != null) ''
+        export PATH=${packages}/bin:${packages}/sbin:$PATH
+      ''}
       ${lib.concatStringsSep "\n" (
         lib.mapAttrsToList (key: value: "export ${key}=${lib.escapeShellArg value}") environment
       )}
@@ -129,6 +134,7 @@ in
   config.system.build.toplevel = import ../system.nix {
     inherit pkgs;
     services = config.system.build.services;
+    packages = config.system.build.packages or null;
     boot = config.system.build.boot;
   };
 }

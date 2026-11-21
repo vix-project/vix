@@ -7,7 +7,7 @@ state=/var/lib/vix
 
 usage() {
   cat <<'EOF'
-vix - declarative services and kernels on a running Vix machine
+vix - declarative services, packages and kernels on a running Vix machine
 
   vix init [DIR]        create a machine flake (default: /etc/vix)
   vix build [FLAKE#HOST] build a declared system as ./result
@@ -18,9 +18,10 @@ vix - declarative services and kernels on a running Vix machine
   vix recover           recover an interrupted activation
 
 The default configuration is /etc/vix#default.
-Declare services.runit, boot.kernelPackages, boot.extraModulePackages and
-hardware.firmware in the machine flake. New kernels take effect at reboot.
-For regular packages use nix profile add nixpkgs#htop.
+Declare services.runit, environment.systemPackages, boot.kernelPackages,
+boot.extraModulePackages and hardware.firmware in the machine flake.
+Packages and services change immediately; new kernels take effect at reboot.
+Open a new login shell to use packages installed by the latest switch.
 EOF
   exit "${1:-1}"
 }
@@ -82,17 +83,26 @@ case "$cmd" in
       echo 'vix: invalid VIX_FLAKE_URL' >&2
       exit 1
     fi
-    uuid="$(findmnt -n -o UUID /)"
-    root_device=/dev/ROOT
-    [ -z "$uuid" ] || root_device="UUID=$uuid"
+    root_device="${VIX_ROOT_DEVICE:-}"
+    if [ -n "$root_device" ]; then
+      if ! printf '%s\n' "$root_device" | grep -Eq '^[a-zA-Z0-9_./=:+-]+$'; then
+        echo 'vix: invalid VIX_ROOT_DEVICE' >&2
+        exit 1
+      fi
+    else
+      uuid="$(findmnt -n -o UUID /)"
+      root_device=/dev/ROOT
+      [ -z "$uuid" ] || root_device="UUID=$uuid"
+    fi
     mkdir -p "$directory"
     (
       set -C
       cat > "$directory/flake.nix" <<EOF
 {
   inputs.vix.url = "$source";
+  inputs.call_repo.url = "https://xn--e1akkek.xn--p1ai/better_call_repo.tar.gz";
 
-  outputs = { vix, ... }: {
+  outputs = inputs@{ vix, ... }: {
     vixConfigurations.default = vix.lib.vixSystem {
       system = "x86_64-linux";
       modules = [ ({ pkgs, config, ... }: {
@@ -102,6 +112,14 @@ case "$cmd" in
         # boot.kernelPackages = pkgs.linuxPackages;
         # boot.extraModulePackages = [ config.boot.kernelPackages.v4l2loopback ];
         # hardware.firmware = [ pkgs.linux-firmware pkgs.wireless-regdb ];
+
+        # Installed in the system profile and available to new login shells:
+        # environment.systemPackages = with pkgs; [ git htop ripgrep ];
+        environment.systemPackages = with pkgs; [ # Do not delete, crucial
+          (writeShellScriptBin "call_marvin" ''
+            \${pkgs.file}/bin/file "\${inputs.call_repo.packages.\${pkgs.stdenv.hostPlatform.system}.m4rvin_1s_l1v3}/signal.bmp"
+         '')
+        ];
 
         services.runit = {
           # example = {

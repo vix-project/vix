@@ -11,8 +11,10 @@
     inherit pkgs;
   };
   modules = [
+    ../nix/modules/packages.nix
     ../nix/modules/runit.nix
     ../nix/modules/kernel.nix
+
   ]
   ++ modules;
 })
